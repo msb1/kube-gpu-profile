@@ -1,0 +1,17 @@
+aws_region        = "us-east-1"
+cluster_name      = "llm-profile"
+vpc_id            = "vpc-0123456789abcdef0"
+efs_file_system_id = "fs-0123456789abcdef0"
+aws_load_balancer_controller_role_arn = "arn:aws:iam::123456789012:role/llm-profile-aws-load-balancer-controller"
+grafana_ingress_cidrs = ["10.40.0.0/16"] # replace with your VPN/private network CIDR(s)
+
+model_archive_urls = {
+  qwen25_7b_instruct  = "https://jfrog.example.com/artifactory/llm-models/qwen2.5-7b-instruct.tar.gz"
+  qwen35_8b           = "https://jfrog.example.com/artifactory/llm-models/qwen3.5-8b.tar.gz"
+  llama31_8b_instruct = "https://jfrog.example.com/artifactory/llm-models/llama3.1-8b-instruct.tar.gz"
+}
+
+selected_model          = "qwen25_7b_instruct"
+use_host_dcgm_engine     = false
+gpu_memory_utilization  = 0.88
+model_max_len           = 8192

@@ -1,0 +1,102 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [{"expr": "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE", "legendFormat": "{{gpu}}", "refId": "A"}],
+      "title": "Tensor pipe activity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "targets": [{"expr": "DCGM_FI_PROF_SM_ACTIVE", "legendFormat": "{{gpu}}", "refId": "A"}],
+      "title": "SM active warp ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 3,
+      "targets": [{"expr": "DCGM_FI_PROF_DRAM_ACTIVE", "legendFormat": "{{gpu}}", "refId": "A"}],
+      "title": "DRAM interface active ratio",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 4,
+      "targets": [{"expr": "DCGM_FI_PROF_PIPE_FP16_ACTIVE", "legendFormat": "{{gpu}}", "refId": "A"}],
+      "title": "FP16 pipe activity",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 5,
+      "targets": [{"expr": "rate(vllm:prompt_tokens_total[5m])", "legendFormat": "{{model}}", "refId": "A"}],
+      "title": "vLLM prompt token throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 6,
+      "targets": [{"expr": "rate(vllm:generation_tokens_total[5m])", "legendFormat": "{{model}}", "refId": "A"}],
+      "title": "vLLM generation token throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "max": 100, "unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "id": 7,
+      "targets": [{"expr": "DCGM_FI_DEV_GPU_UTIL", "legendFormat": "{{gpu}}", "refId": "A"}],
+      "title": "GPU utilization",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "MiB"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "id": 8,
+      "targets": [{"expr": "DCGM_FI_DEV_FB_USED", "legendFormat": "{{gpu}}", "refId": "A"}],
+      "title": "GPU framebuffer memory used",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 32},
+      "id": 9,
+      "targets": [{"expr": "rate(vllm:time_to_first_token_seconds_sum[5m]) / clamp_min(rate(vllm:time_to_first_token_seconds_count[5m]), 1e-9)", "legendFormat": "{{model}}", "refId": "A"}],
+      "title": "vLLM average time to first token",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"min": 0, "unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 32},
+      "id": 10,
+      "targets": [{"expr": "rate(vllm:time_per_output_token_seconds_sum[5m]) / clamp_min(rate(vllm:time_per_output_token_seconds_count[5m]), 1e-9)", "legendFormat": "{{model}}", "refId": "A"}],
+      "title": "vLLM average inter-token latency",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "time": {"from": "now-1h", "to": "now"},
+  "title": "LLM GPU Macro Profiling",
+  "uid": "llm-gpu-profiling",
+  "version": 1
+}
