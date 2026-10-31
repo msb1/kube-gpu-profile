@@ -2,16 +2,35 @@
 # Terraform renders ${namespace} from workloads/variables.tf.
 scrape_configs:
   - job_name: triton-vllm
-    scrape_interval: 15s
-    scrape_timeout: 10s
+    scrape_interval: 5s
+    scrape_timeout: 4s
     metrics_path: /metrics
     scheme: http
-    static_configs:
-      - targets:
-          - triton-vllm.${namespace}.svc.cluster.local:8002
-        labels:
-          component: inference
-          backend: vllm
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ["${namespace}"]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: keep
+        regex: triton-vllm
+      - source_labels: [__meta_kubernetes_pod_container_name]
+        action: keep
+        regex: triton
+      - source_labels: [__meta_kubernetes_pod_container_port_number]
+        action: keep
+        regex: "8002"
+      - source_labels: [__meta_kubernetes_pod_phase]
+        action: keep
+        regex: Running
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - target_label: component
+        replacement: inference
+      - target_label: backend
+        replacement: vllm
 
   - job_name: dcgm-exporter
     scrape_interval: 15s

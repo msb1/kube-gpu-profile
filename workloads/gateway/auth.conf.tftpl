@@ -1,0 +1,7 @@
+# Regex matching preserves case sensitivity for the key; scheme is case insensitive.
+map $http_authorization $inference_authorized {
+  default 0;
+%{ for key in api_keys ~}
+  "~^(?i:Bearer) ${key}$" 1;
+%{ endfor ~}
+}

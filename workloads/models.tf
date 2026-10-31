@@ -2,11 +2,11 @@ locals {
   model_names = ["qwen25_7b_instruct", "qwen35_8b", "llama31_8b_instruct"]
   model_json = {
     for name in local.model_names : name => jsonencode({
-      model                   = "/models/cache/${name}"
-      gpu_memory_utilization  = var.gpu_memory_utilization
-      tensor_parallel_size    = 1
-      max_model_len           = var.model_max_len
-      disable_log_stats       = false
+      model                  = "/models/cache/${name}"
+      gpu_memory_utilization = var.gpu_memory_utilization
+      tensor_parallel_size   = 1
+      max_model_len          = var.model_max_len
+      disable_log_stats      = false
     })
   }
   model_config = {
@@ -85,11 +85,11 @@ resource "kubernetes_storage_class_v1" "efs" {
 resource "kubernetes_persistent_volume_v1" "models" {
   metadata { name = "model-cache-pv" }
   spec {
-    capacity                      = { storage = "1Ti" }
-    volume_mode                   = "Filesystem"
-    access_modes                  = ["ReadWriteMany"]
+    capacity                         = { storage = "1Ti" }
+    volume_mode                      = "Filesystem"
+    access_modes                     = ["ReadWriteMany"]
     persistent_volume_reclaim_policy = "Retain"
-    storage_class_name            = kubernetes_storage_class_v1.efs.metadata[0].name
+    storage_class_name               = kubernetes_storage_class_v1.efs.metadata[0].name
     persistent_volume_source {
       csi {
         driver        = "efs.csi.aws.com"
@@ -131,15 +131,28 @@ resource "kubernetes_deployment_v1" "triton" {
     labels    = { app = "triton-vllm" }
   }
   spec {
-    replicas = 1
+    replicas = var.min_replicas
+    strategy {
+      type = "RollingUpdate"
+      rolling_update {
+        max_surge       = "1"
+        max_unavailable = "0"
+      }
+    }
     selector { match_labels = { app = "triton-vllm" } }
     template {
       metadata { labels = { app = "triton-vllm" } }
       spec {
-        termination_grace_period_seconds = 120
+        termination_grace_period_seconds = var.inference_stream_timeout_seconds + 30
         dynamic "image_pull_secrets" {
           for_each = kubernetes_secret_v1.ngc_registry
           content { name = image_pull_secrets.value.metadata[0].name }
+        }
+        toleration {
+          key      = "nvidia.com/gpu"
+          operator = "Equal"
+          value    = "present"
+          effect   = "NoSchedule"
         }
         init_container {
           name    = "artifactory-model-cache"
@@ -147,6 +160,14 @@ resource "kubernetes_deployment_v1" "triton" {
           command = ["/bin/sh", "-ec"]
           args = [<<-SCRIPT
             mkdir -p /models/cache /models/repository/qwen25_7b_instruct/1 /models/repository/qwen35_8b/1 /models/repository/llama31_8b_instruct/1
+            lock=/models/cache/.download-lock
+            acquired=0
+            for attempt in $(seq 1 900); do
+              if mkdir "$lock" 2>/dev/null; then acquired=1; break; fi
+              sleep 10
+            done
+            [ "$acquired" = 1 ] || { echo "Model cache lock timeout; inspect stale lock" >&2; exit 1; }
+            trap 'rmdir "$lock"' EXIT INT TERM
             for model in qwen25_7b_instruct qwen35_8b llama31_8b_instruct; do
               case "$model" in
                 qwen25_7b_instruct) url="$URL_QWEN25_7B_INSTRUCT" ;;
@@ -197,6 +218,10 @@ resource "kubernetes_deployment_v1" "triton" {
             name       = "models"
             mount_path = "/models"
           }
+          volume_mount {
+            name       = "repository"
+            mount_path = "/models/repository"
+          }
           dynamic "volume_mount" {
             for_each = kubernetes_config_map_v1.artifactory_ca
             content {
@@ -237,6 +262,10 @@ resource "kubernetes_deployment_v1" "triton" {
             name       = "models"
             mount_path = "/models"
           }
+          volume_mount {
+            name       = "repository"
+            mount_path = "/models/repository"
+          }
           dynamic "volume_mount" {
             for_each = toset(local.model_names)
             content {
@@ -258,6 +287,11 @@ resource "kubernetes_deployment_v1" "triton" {
           volume_mount {
             name       = "dshm"
             mount_path = "/dev/shm"
+          }
+          lifecycle {
+            pre_stop {
+              exec { command = ["/bin/sh", "-c", "sleep 15"] }
+            }
           }
           startup_probe {
             http_get {
@@ -301,6 +335,10 @@ resource "kubernetes_deployment_v1" "triton" {
           }
         }
         volume {
+          name = "repository"
+          empty_dir {}
+        }
+        volume {
           name = "dshm"
           empty_dir {
             medium     = "Memory"
@@ -311,10 +349,20 @@ resource "kubernetes_deployment_v1" "triton" {
       }
     }
   }
+  lifecycle {
+    ignore_changes = [spec[0].replicas]
+  }
+  timeouts {
+    create = "45m"
+    # One spare GPU can serialize full-fleet replacement behind long streams.
+    update = "${max(45, ceil(var.max_replicas * (var.inference_stream_timeout_seconds + 1800) / 60))}m"
+  }
   wait_for_rollout = true
   depends_on = [
     kubernetes_persistent_volume_claim_v1.models,
-    helm_release.nvidia_device_plugin
+    helm_release.nvidia_device_plugin,
+    helm_release.gpu_capacity,
+    kubernetes_network_policy_v1.triton
   ]
 }
 

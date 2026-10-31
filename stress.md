@@ -1,5 +1,13 @@
 # Stress testing the OpenAI-compatible Triton/vLLM service
 
+## Primary endpoint for scaling benchmarks
+
+Use the private HTTPS inference ALB and API-key gateway for end-to-end and autoscaling benchmarks. Set `INFERENCE_BASE_URL` to the `inference_base_url` Terraform output, and obtain `INFERENCE_API_KEY` from your secret store. The client needs allowed VPC/VPN connectivity and private DNS. The gateway selects a ready Triton pod for each request, even over reused client connections; active streams remain on their original pod. See [inference.md](inference.md) for setup and verification.
+
+For Locust, set `API_KEY` from the same secret and pass `--host https://<inference_hostname>`; this is the origin **without** `/v1`, since the script includes `/v1` in its request paths. For OpenAI-compatible benchmark tools that take a base URL, use the output including `/v1` and enable the tool's bearer-header/API-key option. Do not pass live keys as literal command-line arguments or save them in result files.
+
+The localhost examples below are retained as administrator diagnostics or a fixed-pod baseline. A direct `triton-vllm` port-forward bypasses the gateway, selects one pod, and cannot measure fleet load distribution, HTTPS, authentication or network-policy enforcement. Use the ALB path for scaling conclusions.
+
 This guide exercises the OpenAI `/v1` API exposed by the workload Terraform. The NVIDIA Triton OpenAI frontend starts an in-process Triton server with the vLLM backend; requests reach the active model through `/v1/chat/completions` or `/v1/completions`. Only one selected model is loaded at a time on the single-GPU node.
 
 ## Included upstream benchmark sources
@@ -14,7 +22,7 @@ References: [vLLM online benchmark](https://github.com/vllm-project/vllm/blob/ma
 
 ## Connect to the private service
 
-The Service is `ClusterIP` only. From a workstation or controlled runner with EKS access, forward its OpenAI and metrics ports:
+For administrator backend diagnostics, the original Service remains `ClusterIP`. From a workstation or controlled runner with EKS access, forward its OpenAI and metrics ports:
 
 ```sh
 kubectl -n llm-serving port-forward svc/triton-vllm 8000:8000 8002:8002
@@ -86,7 +94,7 @@ SSE chunks are not guaranteed to correspond one-to-one with generated tokens. Th
 
 ### Connect the Locust client
 
-The inference Service is private. Run Locust from an approved client on the VPC/VPN network, or use the same temporary API port-forward as the other tests. For a workstation with EKS access, in a separate terminal:
+Run Locust against the inference ALB from an approved VPC/VPN client with `API_KEY` set. For a single-pod administrator baseline only, a workstation with EKS access can instead forward the backend API in a separate terminal:
 
 ```sh
 kubectl -n llm-serving port-forward svc/triton-vllm 8000:8000
@@ -122,9 +130,9 @@ locust -f ~/Code/kube-gpu-profile/tools/locust-capacity/locustfile.py \
   --html capacity-results/locust-report.html
 ```
 
-`MODEL` must equal the active Terraform `selected_model`: `qwen25_7b_instruct`, `qwen35_8b`, or `llama31_8b_instruct`. The endpoint may require a larger `model_max_len` or lower `MAX_TOKENS` if your configured context window is smaller. Set `LOCUST_PROMPT` to a representative, non-confidential prompt. The default user wait is 2–5 seconds; adjust `WAIT_TIME_MIN`/`WAIT_TIME_MAX` to model your application's request cadence. If Locust runs directly on the VPC, use `--host http://<private-client-reachable-address>:8000` instead of localhost and omit the port-forward.
+`MODEL` must equal the active Terraform `selected_model`: `qwen25_7b_instruct`, `qwen35_8b`, or `llama31_8b_instruct`. The endpoint may require a larger `model_max_len` or lower `MAX_TOKENS` if your configured context window is smaller. Set `LOCUST_PROMPT` to a representative, non-confidential prompt. The default user wait is 2–5 seconds; adjust `WAIT_TIME_MIN`/`WAIT_TIME_MAX` to model your application's request cadence. For the complete serving path, use `--host https://<inference_hostname>` instead of localhost and omit the port-forward.
 
-If API-key authentication is later enforced on `/v1`, export `API_KEY` from your secret store before starting Locust; the script sends it as `Authorization: Bearer …`. Do not put the key in the command line, CSV, or a committed file.
+API-key authentication is enforced on the inference ALB path. Export `API_KEY` from your secret store before starting Locust; the script sends it as `Authorization: Bearer …`. Do not put the key in the command line, CSV, or a committed file.
 
 For a shorter pilot, lower `MAX_USERS`; for finer resolution use `STEP_USERS=1` and increase `STEP_SECONDS`. Do not change several workload factors at once. Run a warm-up, then repeat the same prompt, output cap, step schedule, model, and instance type for comparisons.
 
@@ -136,7 +144,7 @@ For a shorter pilot, lower `MAX_USERS`; for finer resolution use `STEP_USERS=1` 
 - In the provisioned Grafana dashboard, correlate each plateau with `DCGM_FI_DEV_GPU_UTIL`, framebuffer memory used/free, the four DCGM profiling counters, vLLM token throughput, TTFT and TPOT. Use `dcgmi dmon` through the SSM path only if the optional host DCGM package/engine is enabled in both Terraform roots as described in [operation.md](operation.md).
 - The maximum acceptable capacity tier is the highest sustained plateau that meets the chosen TTFT/TPOT and error-rate objectives without GPU memory exhaustion, pod restarts, or throughput collapse. Confirm it in at least two repeat runs and select an operational limit below the first failing tier to leave headroom.
 
-Do not label a plateau as “KV-cache exhausted” from rising latency or framebuffer usage alone: the current Triton vLLM integration does not forward KV-cache usage or preemption metrics. Likewise, GPU utilization below 100% does not rule out queueing, memory pressure, or a client-side bottleneck. Record the evidence and call it capacity degradation unless direct KV-cache telemetry becomes available.
+Correlate latency with the custom image’s `llm_kv_cache_usage_ratio` and `llm_num_requests_waiting` before attributing degradation to KV pressure. Framebuffer usage alone is insufficient; preemption counters remain unavailable. GPU utilization below 100% does not rule out queueing, memory pressure, or a client-side bottleneck. Record per-pod evidence rather than inferring KV exhaustion from latency alone.
 
 ## NVIDIA GenAI-Perf
 
@@ -298,4 +306,10 @@ Record model alias, EC2 type, image tag, date, tokenizer, prompt/output sizes, c
 
 ## Cost and access
 
-Keep the inference service private and use port forwarding or an approved private client path; Grafana is accessed through its internal ALB over VPN/private networking. Do not expose Triton or Grafana publicly for testing. Run finite tests in steps and scale the GPU node group to zero when idle to avoid unnecessary EC2 charges, as described in [operation.md](operation.md).
+Keep the inference service private and use port forwarding or an approved private client path; Grafana is accessed through its internal ALB over VPN/private networking. Do not expose Triton or Grafana publicly for testing. Run finite tests in steps and use the deliberate GPU shutdown procedure in [autoscaling.md](autoscaling.md) when a full stop is appropriate.
+
+## Validate KEDA and Karpenter under load
+
+Use the procedures and metrics in [autoscaling.md](autoscaling.md#deployment-and-migration-checklist). Run a fixed-replica baseline first by pausing the ScaledObject at your chosen replica count. Then restore autoscaling and repeat finite load steps, recording HPA desired/current replicas, pending/ready pods, NodeClaim creation, EC2 launch and image/model initialization times, KV usage, waiting work and TTFT. Allow at least the configured cold-start and stabilization windows before evaluating reductions.
+
+The service’s port-forward is useful for single-replica diagnostics but routes connections to one selected pod. A scaling benchmark must use the authenticated inference ALB/gateway from an allowed private client; its per-request upstream selection allows new replicas to receive work. Do not expect an existing streaming connection to move between replicas. Compare load distribution by pod in Grafana. Stop the test before exhausting budgets; retain the HPA maximum and NodePool limits. Use the documented pause/zero/drain workflow for a complete GPU shutdown; setting legacy managed-group size to zero does not stop Karpenter nodes.

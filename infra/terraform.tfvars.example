@@ -9,7 +9,7 @@ admin_cidr_blocks = ["203.0.113.10/32"]
 # IAM user/role ARN used by Terraform and kubectl; do not use an STS session ARN.
 cluster_admin_arn = "arn:aws:iam::123456789012:role/your-terraform-operator"
 
-# Request 0/0 to stop GPU compute when idle; use 1/1/1 to start with one GPU node.
-gpu_min_size     = 1
-gpu_desired_size = 1
+# Legacy managed GPU capacity. Keep zero when Karpenter owns GPU provisioning.
+gpu_min_size     = 0
+gpu_desired_size = 0
 gpu_max_size     = 1

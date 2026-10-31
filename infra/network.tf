@@ -32,8 +32,8 @@ resource "aws_subnet" "private" {
   availability_zone = local.azs[count.index]
   cidr_block        = cidrsubnet(var.vpc_cidr, 8, count.index + 10)
   tags = merge(var.tags, {
-    Name                              = "${var.name}-private-${local.azs[count.index]}"
-    "kubernetes.io/role/internal-elb" = "1"
+    Name                                = "${var.name}-private-${local.azs[count.index]}"
+    "kubernetes.io/role/internal-elb"   = "1"
     "kubernetes.io/cluster/${var.name}" = "shared"
   })
 }

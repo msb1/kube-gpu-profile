@@ -7,6 +7,12 @@ resource "helm_release" "nvidia_device_plugin" {
   create_namespace = true
   wait             = true
   timeout          = 900
+  values = [yamlencode({
+    nodeSelector = { workload = "gpu-inference" }
+    # The chart otherwise requires NFD labels, which this stack does not install.
+    affinity    = null
+    tolerations = [{ key = "nvidia.com/gpu", operator = "Exists", effect = "NoSchedule" }]
+  })]
 }
 
 resource "helm_release" "dcgm_exporter" {
@@ -20,8 +26,9 @@ resource "helm_release" "dcgm_exporter" {
   timeout          = 900
   depends_on       = [kubernetes_namespace_v1.observability]
   values = [yamlencode({
-    hostNetwork = var.use_host_dcgm_engine
-    arguments   = var.use_host_dcgm_engine ? ["-r", "127.0.0.1:5555"] : []
+    tolerations   = [{ key = "nvidia.com/gpu", operator = "Exists", effect = "NoSchedule" }]
+    hostNetwork   = var.use_host_dcgm_engine
+    arguments     = var.use_host_dcgm_engine ? ["-r", "127.0.0.1:5555"] : []
     customMetrics = <<-CSV
       DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization percentage.
       DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used in MiB.
@@ -74,8 +81,9 @@ resource "helm_release" "alloy_ebpf_profiler" {
 
   values = [yamlencode({
     controller = {
-      type      = "daemonset"
-      hostPID   = true
+      type        = "daemonset"
+      hostPID     = true
+      tolerations = [{ key = "nvidia.com/gpu", operator = "Exists", effect = "NoSchedule" }]
       nodeSelector = {
         workload = "gpu-inference"
       }
@@ -188,6 +196,17 @@ resource "helm_release" "prometheus_stack" {
   timeout          = 1200
 
   values = [yamlencode({
+    additionalPrometheusRulesMap = {
+      triton-autoscaling = {
+        groups = [{ name = "triton-autoscaling", rules = [{
+          alert       = "TritonAutoscalingTelemetryIncomplete"
+          expr        = "absent(${local.complete_stats}) and on() (max(kube_deployment_spec_replicas{namespace=\"${var.namespace}\",deployment=\"triton-vllm\"}) > 0)"
+          for         = "2m"
+          labels      = { severity = "warning" }
+          annotations = { summary = "Triton autoscaling telemetry is missing, stale, or incomplete", description = "Check pod scrapes, custom image gauges and kube-state-metrics before relying on scaling decisions." }
+        }] }]
+      }
+    }
     grafana = {
       adminPassword = var.grafana_admin_password
       plugins       = ["grafana-pyroscope-app"]

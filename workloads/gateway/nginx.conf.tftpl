@@ -1,0 +1,56 @@
+worker_processes 2;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+worker_shutdown_timeout ${stream_timeout}s;
+events { worker_connections 4096; }
+http {
+  client_body_temp_path /tmp/client_temp;
+  proxy_temp_path /tmp/proxy_temp;
+  fastcgi_temp_path /tmp/fastcgi_temp;
+  uwsgi_temp_path /tmp/uwsgi_temp;
+  scgi_temp_path /tmp/scgi_temp;
+  # No Authorization header, request body, query string or prompt in access logs.
+  log_format inference '$remote_addr $request_method $uri $status $request_time upstream=$upstream_addr';
+  access_log /dev/stdout inference;
+  server_tokens off;
+  include /etc/nginx/secrets/auth.conf;
+  resolver ${dns_resolver} valid=5s ipv6=off;
+  resolver_timeout 3s;
+  upstream triton_ready {
+    zone triton_ready 256k;
+    least_conn;
+    server ${backend_host}:9000 resolve;
+    keepalive 32;
+    keepalive_timeout 5s;
+  }
+  server {
+    listen 8080;
+    client_max_body_size 16m;
+    client_body_timeout ${stream_timeout}s;
+    send_timeout ${stream_timeout}s;
+    # Local liveness/readiness does not consume a model slot or need an API key.
+    location = /healthz { access_log off; return 200 'ok\n'; }
+    location /v1/ {
+      default_type application/json;
+      if ($inference_authorized = 0) { return 401 '{"error":{"message":"Invalid or missing API key","type":"authentication_error"}}'; }
+      proxy_pass http://triton_ready;
+      proxy_http_version 1.1;
+      proxy_set_header Connection "";
+      proxy_set_header Host $host;
+      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+      proxy_set_header X-Forwarded-Proto https;
+      proxy_set_header Authorization "";
+      proxy_connect_timeout 5s;
+      proxy_read_timeout ${stream_timeout}s;
+      proxy_send_timeout ${stream_timeout}s;
+      proxy_buffering off;
+      proxy_request_buffering off;
+      proxy_cache off;
+      gzip off;
+      # Never replay an inference request on another pod after an upstream error.
+      proxy_next_upstream off;
+      add_header X-Accel-Buffering no always;
+    }
+    location / { return 404; }
+  }
+}

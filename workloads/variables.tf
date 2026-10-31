@@ -96,9 +96,12 @@ variable "ngc_api_key" {
 }
 
 variable "triton_image" {
-  description = "NVIDIA Triton image tag that includes the vLLM backend; confirm the backend/model compatibility before changing."
+  description = "Custom Triton image including images/triton-metrics extension, pinned by digest; review backend and model compatibility before changing."
   type        = string
-  default     = "nvcr.io/nvidia/tritonserver:26.04-vllm-python-py3"
+  validation {
+    condition     = can(regex("@sha256:[0-9a-f]{64}$", var.triton_image))
+    error_message = "Provide the custom metrics image pinned by sha256 digest. Build images/triton-metrics first."
+  }
 }
 
 variable "namespace" {

@@ -1,5 +1,7 @@
 # Operations guide
 
+Before following the deployment commands below, complete the [autoscaling image, AMI, input wiring and migration procedure](autoscaling.md#deployment-and-migration-checklist). The stock Triton image is no longer a valid `triton_image` input. Also complete [inference endpoint setup](inference.md): Terraform creates the separate internal HTTPS ALB, API-key gateway, ACM validation and private DNS.
+
 ## Prerequisites
 
 - Terraform 1.6+, AWS CLI, `kubectl`, and Helm installed locally. Terraform's Kubernetes and Helm providers use the AWS CLI exec credential plugin to refresh EKS tokens during longer applies.
@@ -11,6 +13,34 @@
 - A JFrog token authorized to read those artifact paths; a separate Grafana initial admin password.
 - If JFrog uses a private certificate authority, the PEM CA certificate can be supplied as `artifactory_ca_certificate` in the workloads tfvars file; this is a public certificate, not a private key.
 - If NGC requires authenticated image pulls for your account, an NGC API key (optional `TF_VAR_ngc_api_key`).
+- An owned DNS hostname and existing authoritative public Route 53 parent zone for automatic ACM validation. Terraform creates a private zone/alias for the inference endpoint; VPN clients need private DNS resolution.
+- One or more randomly generated inference API keys supplied as `TF_VAR_inference_api_keys`, a JSON array; see [inference.md](inference.md).
+
+## How the LLM is loaded
+
+You need both a container image for the inference server and separate model files. The model weights are not baked into the server image, and this setup does not download models directly from Hugging Face at runtime.
+
+| Item | Purpose | Configuration or implementation |
+| --- | --- | --- |
+| Custom Docker image | Contains Triton, vLLM, the OpenAI frontend, and the autoscaling metrics extension | Build [images/triton-metrics/Dockerfile](images/triton-metrics/Dockerfile); set `triton_image` to the published image digest |
+| Model archives | Contain Hugging Face model weights, tokenizer, and configuration files | Set all three `model_archive_urls` in `workloads/terraform.tfvars`; see [the example](workloads/terraform.tfvars.example) |
+| Active model | Chooses which cached model each serving replica loads into its GPU | Set `selected_model` in `workloads/terraform.tfvars` |
+
+The loading sequence is implemented in [workloads/models.tf](workloads/models.tf):
+
+1. The `artifactory-model-cache` init container downloads all three archives from JFrog Artifactory using the bearer token supplied through `TF_VAR_artifactory_token`. It extracts each archive into `/models/cache/<model-alias>` on shared EFS storage. A directory lock serializes concurrent downloads, and a `.download-complete` marker allows subsequent starts to reuse the cached files.
+2. Terraform generates each model's `config.pbtxt` and `model.json` through the `triton_models` ConfigMaps. The configuration selects the vLLM backend and points its `model` setting to the local EFS path, such as `/models/cache/qwen25_7b_instruct`.
+3. The main container starts the OpenAI frontend with `--model-control-mode=explicit` and `--load-model=<selected_model>`. Triton initializes the vLLM backend, which reads the selected weights and tokenizer from EFS and loads the model into GPU memory. Each replica loads its own model copy onto its own GPU; the other two models remain cached on EFS.
+
+To prepare an archive, obtain the complete model snapshot from Hugging Face or your approved model source, including all weight shards, tokenizer files, and model configuration files. Package the snapshot contents at the archive root, rather than inside an extra enclosing directory. For example, from the repository root:
+
+```sh
+tar -czf qwen2.5-7b-instruct.tar.gz -C /path/to/complete-model-snapshot .
+```
+
+If the snapshot uses symbolic links into a local download cache, first materialize those files into a self-contained directory. Upload the archive to Artifactory and put its direct HTTPS download URL in the corresponding `model_archive_urls` entry. Repeat for all three configured aliases. Model access permissions, licenses, and compatibility with the bundled vLLM version must be satisfied for the artifacts you use.
+
+Build and publish the custom server image separately, following [the image build instructions](autoscaling.md#custom-image-and-metrics-contract). The Dockerfile adds the metrics extension to the NVIDIA Triton image; it does not download or package the LLM weights. For model changes after deployment, see [Switch the active model](#switch-the-active-model).
 
 ## Configure
 
@@ -23,11 +53,13 @@ cp workloads/terraform.tfvars.example workloads/terraform.tfvars
 
 In `infra/terraform.tfvars`, set a secure API CIDR, the IAM role/user ARN, region, and instance choice. `g7.8xlarge` is the default; if unavailable, choose `g5.4xlarge` or `g6.8xlarge`. Check the region's GPU quotas and availability before spending time on apply.
 
-In `workloads/terraform.tfvars`, set `cluster_name`, `aws_region`, `vpc_id`, `efs_file_system_id`, `aws_load_balancer_controller_role_arn`, `grafana_ingress_cidrs`, and the three direct archive URLs. The role ARN and VPC ID are outputs from the infra root. Set the CIDR list to the trusted VPN/private client networks that need Grafana access. Do not put JFrog or Grafana passwords in this file. Export Terraform input variables in your shell or CI secret store instead:
+In `workloads/terraform.tfvars`, set `inference_hostname`, `inference_certificate_validation_zone_id` (public parent zone), `inference_ingress_cidrs`, and the Karpenter outputs, `private_subnet_ids`, `node_security_group_id`, tested `gpu_ami_id`, custom digest-pinned `triton_image`, and `cluster_name`, `aws_region`, `vpc_id`, `efs_file_system_id`, `aws_load_balancer_controller_role_arn`, `grafana_ingress_cidrs`, and the three direct archive URLs. The role ARN and VPC ID are outputs from the infra root. Set the CIDR list to the trusted VPN/private client networks that need Grafana access. Do not put JFrog or Grafana passwords in this file. Export Terraform input variables in your shell or CI secret store instead:
 
 ```sh
 export TF_VAR_artifactory_token='your-jfrog-token'
 export TF_VAR_grafana_admin_password='use-a-unique-long-password'
+# Load actual randomly generated keys from your secret store as a JSON array:
+export TF_VAR_inference_api_keys='["REPLACE_WITH_A_RANDOM_URL_SAFE_KEY_OF_AT_LEAST_32_CHARACTERS"]'
 # Optional, if nvcr.io requires authentication:
 export TF_VAR_ngc_api_key='your-ngc-api-key'
 ```
@@ -51,6 +83,11 @@ terraform output -raw aws_region
 terraform output -raw efs_file_system_id
 terraform output -raw vpc_id
 terraform output -raw aws_load_balancer_controller_role_arn
+terraform output -raw karpenter_role_arn
+terraform output -raw karpenter_node_role_name
+terraform output -raw karpenter_queue_name
+terraform output -json private_subnet_ids
+terraform output -raw node_security_group_id
 ```
 
 Configure `workloads/terraform.tfvars` with those values, including `grafana_ingress_cidrs` set to the trusted VPN/private network CIDRs that should reach the internal Grafana load balancer. Then configure kubectl. From the `infra/` directory:
@@ -61,7 +98,7 @@ kubectl get nodes -o wide
 kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu
 ```
 
-Wait until the GPU node is `Ready` and reports one allocatable GPU. The workload provider root cannot be applied from a machine/network that cannot reach the EKS public endpoint. Restrict `admin_cidr_blocks` to the current trusted egress CIDR; use VPN or a controlled runner.
+Wait until the two CPU system nodes are `Ready`. Karpenter creates the first GPU node during workloads apply; the NVIDIA plugin must then advertise its GPU. The workload provider root cannot be applied from a machine/network that cannot reach the EKS public endpoint. Restrict `admin_cidr_blocks` to the current trusted egress CIDR; use VPN or a controlled runner.
 
 ### Secure GPU worker shell (optional)
 
@@ -104,22 +141,31 @@ kubectl -n llm-serving logs deploy/triton-vllm -c triton -f
 kubectl -n observability get pods
 ```
 
-Verify GPU allocation and OpenAI frontend readiness. The inference service exposes OpenAI-compatible HTTP on port 8000 and Triton metrics (including enabled vLLM custom metrics) on port 8002; it remains a private ClusterIP. Terraform also creates a private ALB for Grafana, restricted to `grafana_ingress_cidrs`.
+Verify GPU allocation and the authenticated inference endpoint from an allowed VPC/VPN client. Terraform creates two independent internal ALBs: inference uses HTTPS and bearer keys, while Grafana retains its existing listener and CIDR controls.
 
 ```sh
 kubectl get nodes -o custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu
-kubectl -n llm-serving port-forward svc/triton-vllm 8000:8000 8002:8002
+kubectl -n llm-serving get ingress inference
+kubectl -n llm-serving get pods -l app=inference-gateway
+export INFERENCE_BASE_URL="$(terraform output -raw inference_base_url)"
+# Supply INFERENCE_API_KEY from the secret store, matching a configured key.
+curl --fail-with-body "$INFERENCE_BASE_URL/models" \
+  -H "Authorization: Bearer $INFERENCE_API_KEY"
+curl --fail-with-body --no-buffer "$INFERENCE_BASE_URL/chat/completions" \
+  -H "Authorization: Bearer $INFERENCE_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen25_7b_instruct","messages":[{"role":"user","content":"Explain PagedAttention in one sentence."}],"temperature":0.2,"max_tokens":128,"stream":true}'
 ```
 
-In another terminal:
+Requests to `/v1/models` without a key or with an invalid key must return 401. Use the configured inference DNS hostname so TLS certificate validation succeeds; the raw ALB hostname does not match the certificate. [inference.md](inference.md) includes DNS, certificate, streaming, key rotation and network-policy verification.
+
+For an administrator-only backend readiness/metrics check, use a temporary port-forward. This bypasses the gateway and is not a test of authentication or pod network isolation:
 
 ```sh
+kubectl -n llm-serving port-forward svc/triton-vllm 8000:8000 8002:8002
+# In another terminal:
 curl -fsS http://127.0.0.1:8000/health/ready
-curl -fsS http://127.0.0.1:8000/v1/models
-curl -fsS http://127.0.0.1:8002/metrics | grep -E 'nv_gpu|vllm:' | head
-curl -sS http://127.0.0.1:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen25_7b_instruct","messages":[{"role":"user","content":"Explain PagedAttention in one sentence."}],"temperature":0.2,"max_tokens":128,"stream":false}'
+curl -fsS http://127.0.0.1:8002/metrics | grep -E 'llm_|nv_gpu|vllm:' | head
 ```
 
 The OpenAI-compatible frontend is launched from the pinned Triton `26.04-vllm-python-py3` image and uses the selected model's tokenizer from `/models/cache/<selected_model>`. Confirm that the image contains the frontend and that the bundled vLLM supports each artifact architecture before serving traffic. Also confirm the GPU node's NVIDIA driver meets the image's CUDA driver minimum. The EKS NVIDIA AMI is updated independently of the Triton image.
@@ -133,11 +179,7 @@ kubectl -n observability get ingress grafana
 
 The hostname resolves and connects only from the VPC or a connected network. Open `http://<hostname>/` and sign in as `admin` using the password supplied through `TF_VAR_grafana_admin_password`. The ALB is internal and HTTP-only in this starter configuration; use a private ACM certificate and HTTPS listener for production access across networks that are not fully trusted.
 
-Workloads inside the cluster should configure their OpenAI client with `base_url = "http://triton-vllm.llm-serving.svc.cluster.local:8000/v1"` and set `model` to the active alias. The frontend does not enforce API-key authentication; only workloads with cluster network access can reach the private ClusterIP, so add an authenticated ingress/gateway before exposing it beyond the cluster.
-
-**Production requirement:** configure and enforce API-key authentication for inference requests before production use, including clients that reach the service from inside the cluster. Keep keys in a secret manager, rotate them, and do not place them in Terraform source or checked-in tfvars. The current starter deployment leaves this enforcement unconfigured.
-
-Check Prometheus targets and the NVIDIA DCGM dashboard. The Terraform-managed `workloads/prometheus.yml` scrapes the Triton metrics endpoint on Service port 8002, including the vLLM subset forwarded by the backend, and `dcgm-exporter` hardware/profiling metrics on port 9400. In Prometheus, open **Status → Targets** and confirm both jobs are `UP`. Useful queries include `vllm:prompt_tokens_total`, `vllm:time_to_first_token_seconds_count`, and `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE`; metric availability can vary by backend/GPU support. The current Triton vLLM backend does not expose vLLM KV-cache usage or preemption metrics through its documented custom metrics set. Alloy eBPF profiles CPU stacks from the Triton process; use Grafana's Profiles Drilldown and select the Triton service/profile type. These are CPU profiles, not CUDA kernel profiles.
+Application clients, including cluster-internal clients, should use the `inference_base_url` Terraform output with a configured bearer API key and `model` matching `selected_model`. The gateway validates the key and discovers ready Triton pods via a headless Service, balancing each new request while leaving active streams on their original pod. Direct API access to Triton is restricted by network policy; Prometheus retains access to metrics. Apply infra first to enable VPC CNI network-policy support and verify enforcement. See [inference.md](inference.md) for the standard-mode startup window and administrative access boundaries.
 
 ## Switch the active model
 
@@ -149,16 +191,19 @@ selected_model = "qwen25_7b_instruct"
 # selected_model = "llama31_8b_instruct"
 ```
 
-Then run `terraform plan` and `terraform apply` in `workloads/`. The Triton OpenAI frontend restarts and loads the chosen model. The service has one replica and there will be an inference interruption during the switch. All archives remain cached on EFS. If replacing an archive at a URL, remove `/models/cache/<alias>/.download-complete` (and stale contents) from EFS before restarting, or use a new immutable URL.
+Then run `terraform plan` and `terraform apply` in `workloads/`. The Triton OpenAI frontend restarts and loads the chosen model. Rolling updates preserve available replicas using one surge GPU; each new replica loads the chosen model. Existing streams and forced evictions still require careful handling. All archives remain cached on EFS. If replacing an archive at a URL, remove `/models/cache/<alias>/.download-complete` (and stale contents) from EFS before restarting, or use a new immutable URL.
 
 ## Scale GPU capacity
 
-Change `gpu_desired_size` and `gpu_max_size` in `infra/terraform.tfvars`, then apply the infra root. One replica requesting one GPU uses one node. Additional nodes provide scheduling capacity but Terraform does not create extra Triton replicas automatically. If replicating Triton, each replica loads its own model into its own GPU and raises the hourly EC2 bill. EFS shares files, not GPU memory.
+KEDA manages Triton replicas from `min_replicas` (default 1) to `max_replicas` (default 10), using scheduler KV-cache pressure and waiting requests. Karpenter provisions one GPU per pending Triton replica and consolidates empty nodes after ten minutes. See [autoscaling.md](autoscaling.md) for image builds, infra outputs, AMI selection, migration, full validation, tuning, rollback and shutdown.
 
-To stop GPU spending when idle, set `gpu_desired_size = 0` and `gpu_min_size = 0`, then apply infra. Triton remains pending/unavailable until GPU capacity returns. EKS, NAT, EFS, logs and observability may continue to incur charges.
+Change bounds/thresholds in `workloads/terraform.tfvars` and apply workloads. Do not change `Deployment.spec.replicas` through Terraform: the HPA owns it. The legacy `gpu_desired_size`, `gpu_min_size`, `gpu_max_size` variables affect only the managed GPU group; keep desired/minimum zero after migration. Increasing those values adds manual capacity outside the Karpenter limit.
+
+A minimum of one serving replica is required because pod-local metrics cannot wake a stopped service. To suspend GPU spending deliberately, stop clients, pause the ScaledObject, scale Triton to zero and let Karpenter delete empty nodes; restoring replicas is a manual action. EKS, CPU system nodes, NAT, EFS, logs and observability continue to incur charges.
 
 ## Secrets and state handling
 
+- Rotate inference API keys with the two-phase overlap procedure in [inference.md](inference.md#rotation-maintenance-and-teardown); applying key changes rolls the gateway automatically.
 - Rotate the JFrog access token and update the shell/CI secret value, then apply the workloads root.
 - Rotate Grafana's admin password through Grafana and the Terraform input together to avoid drift.
 - The secret is present in Kubernetes and Terraform state. Restrict Kubernetes RBAC, state bucket IAM, encryption keys, state lock access, backups, and CI artifacts accordingly.
@@ -166,7 +211,7 @@ To stop GPU spending when idle, set `gpu_desired_size = 0` and `gpu_min_size = 0
 
 ## Teardown
 
-Delete workload resources first, then AWS infrastructure:
+First stop inference ALB clients and drain gateway streams. Keep AWS Load Balancer Controller running until both ingress ALBs have been deleted. Follow the drain procedure in [autoscaling.md](autoscaling.md#failure-modes-rollback-and-teardown): pause scaling, scale serving to zero, delete the GPU NodePool while Karpenter is running, and wait for NodeClaims/EC2 instances to disappear. Then delete workload resources and AWS infrastructure:
 
 ```sh
 cd workloads

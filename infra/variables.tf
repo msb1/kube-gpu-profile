@@ -31,13 +31,13 @@ variable "gpu_instance_type" {
 variable "gpu_min_size" {
   type        = number
   description = "Minimum GPU worker count. Set to 0 to scale down when idle."
-  default     = 1
+  default     = 0
 }
 
 variable "gpu_desired_size" {
   type        = number
   description = "Initial GPU worker count. A single-GPU node can serve one selected 7B/8B model at a time."
-  default     = 1
+  default     = 0
 }
 
 variable "gpu_max_size" {

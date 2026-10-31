@@ -1,7 +1,7 @@
 resource "aws_iam_role" "cluster" {
   name = "${var.name}-cluster-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "eks.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
   tags = var.tags
@@ -15,7 +15,7 @@ resource "aws_iam_role_policy_attachment" "cluster" {
 resource "aws_iam_role" "node" {
   name = "${var.name}-gpu-node-role"
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
   tags = var.tags
@@ -70,9 +70,10 @@ resource "aws_eks_access_policy_association" "admin" {
 }
 
 resource "aws_eks_addon" "core" {
-  for_each = toset(["vpc-cni", "coredns", "kube-proxy"])
+  for_each                    = toset(["vpc-cni", "coredns", "kube-proxy"])
   cluster_name                = aws_eks_cluster.main.name
   addon_name                  = each.value
+  configuration_values        = each.key == "vpc-cni" ? jsonencode({ enableNetworkPolicy = "true" }) : null
   resolve_conflicts_on_update = "PRESERVE"
 }
 
@@ -88,9 +89,9 @@ resource "aws_iam_role" "efs_csi" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Federated = aws_iam_openid_connect_provider.eks.arn }
-      Action = "sts:AssumeRoleWithWebIdentity"
+      Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = { StringEquals = {
         "${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:aud" = "sts.amazonaws.com"
         "${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:efs-csi-controller-sa"
@@ -111,9 +112,9 @@ resource "aws_iam_role" "aws_load_balancer_controller" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect    = "Allow"
       Principal = { Federated = aws_iam_openid_connect_provider.eks.arn }
-      Action = "sts:AssumeRoleWithWebIdentity"
+      Action    = "sts:AssumeRoleWithWebIdentity"
       Condition = { StringEquals = {
         "${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:aud" = "sts.amazonaws.com"
         "${replace(aws_eks_cluster.main.identity[0].oidc[0].issuer, "https://", "")}:sub" = "system:serviceaccount:kube-system:aws-load-balancer-controller"
@@ -150,19 +151,19 @@ resource "aws_iam_policy" "aws_load_balancer_controller" {
         Resource = "*"
       },
       {
-        Effect = "Allow"
-        Action = ["iam:CreateServiceLinkedRole"]
-        Resource = "*"
+        Effect    = "Allow"
+        Action    = ["iam:CreateServiceLinkedRole"]
+        Resource  = "*"
         Condition = { StringEquals = { "iam:AWSServiceName" = "elasticloadbalancing.amazonaws.com" } }
       },
       {
-        Effect = "Allow"
-        Action = ["ec2:AuthorizeSecurityGroupIngress", "ec2:RevokeSecurityGroupIngress", "ec2:CreateSecurityGroup"]
+        Effect   = "Allow"
+        Action   = ["ec2:AuthorizeSecurityGroupIngress", "ec2:RevokeSecurityGroupIngress", "ec2:CreateSecurityGroup"]
         Resource = "*"
       },
       {
-        Effect = "Allow"
-        Action = ["ec2:CreateTags", "ec2:DeleteTags", "ec2:DeleteSecurityGroup"]
+        Effect   = "Allow"
+        Action   = ["ec2:CreateTags", "ec2:DeleteTags", "ec2:DeleteSecurityGroup"]
         Resource = "arn:aws:ec2:*:*:security-group/*"
       },
       {
@@ -219,7 +220,7 @@ resource "aws_eks_node_group" "gpu" {
     aws_iam_role_policy_attachment.node_ssm,
     aws_eks_addon.core
   ]
-  tags = var.tags
+  tags = merge(var.tags, { "gpu-profile-cluster" = var.name })
 }
 
 # Optional host DCGM engine and CLI. DCGM Exporter can connect to this engine
@@ -231,12 +232,13 @@ resource "aws_ssm_association" "install_dcgm_cli" {
   association_name    = "${var.name}-install-dcgm-cli"
   schedule_expression = "rate(1 day)"
   targets {
-    key    = "tag:aws:eks:cluster-name"
+    key    = "tag:gpu-profile-cluster"
     values = [aws_eks_cluster.main.name]
   }
   parameters = {
     commands = <<-SCRIPT
       set -eu
+      command -v nvidia-smi >/dev/null 2>&1 || exit 0
       CUDA_VERSION=$(nvidia-smi -q | sed -nE 's/^[[:space:]]*CUDA Version[[:space:]]*:[[:space:]]*([0-9]+)\..*/\1/p' | head -n1)
       case "$CUDA_VERSION" in
         ''|*[!0-9]*)

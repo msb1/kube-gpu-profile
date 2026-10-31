@@ -1,0 +1,5 @@
+apiVersion: v2
+name: autoscaling-resources
+description: Terraform-rendered custom resources, installed after their CRDs exist
+type: application
+version: 0.1.0

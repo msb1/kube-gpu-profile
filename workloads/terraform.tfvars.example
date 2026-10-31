@@ -15,3 +15,29 @@ selected_model          = "qwen25_7b_instruct"
 use_host_dcgm_engine     = false
 gpu_memory_utilization  = 0.88
 model_max_len           = 8192
+
+# Copy these outputs from infra after apply.
+karpenter_role_arn       = "arn:aws:iam::123456789012:role/KarpenterController-example"
+karpenter_node_role_name = "Karpenter-example"
+karpenter_queue_name     = "Karpenter-example"
+private_subnet_ids      = ["subnet-0123456789abcdef0", "subnet-0123456789abcdef1", "subnet-0123456789abcdef2"]
+node_security_group_id  = "sg-0123456789abcdef0"
+gpu_ami_id              = "ami-0123456789abcdef0" # tested NVIDIA AL2023 AMI, not standard CPU AMI
+triton_image            = "123456789012.dkr.ecr.us-east-1.amazonaws.com/triton-autoscaling@sha256:REPLACE_WITH_64_HEX_DIGEST"
+min_replicas            = 1
+max_replicas            = 10
+kv_cache_target         = 0.8
+waiting_requests_target = 4
+# Unordered eligibility list. Remove types that cannot hold the selected model.
+gpu_instance_types      = ["g7.8xlarge", "g6.8xlarge", "g5.4xlarge"]
+
+# Set 0 for deliberate serving suspension, or N for a fixed fleet; null resumes KEDA.
+paused_replicas = null
+
+# Dedicated internal inference ALB, managed certificate and private DNS.
+# Public validation zone must be authoritative for your owned domain.
+inference_hostname                       = "llm.inference.example.com"
+inference_certificate_validation_zone_id = "Z0123456789EXAMPLE"
+inference_ingress_cidrs                   = ["10.40.0.0/16"] # actual client/VPN source CIDRs
+inference_stream_timeout_seconds          = 900
+# Never place real keys here. Supply TF_VAR_inference_api_keys as a JSON array.

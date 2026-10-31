@@ -2,7 +2,7 @@
 
 ## What this project builds
 
-This project provisions a standard Amazon EKS cluster with an AWS-managed Kubernetes control plane and managed EC2 GPU worker nodes. Terraform also creates a VPC, private worker subnets, NAT egress, EFS model cache, NVIDIA GPU scheduling, Triton with its vLLM backend, and a Prometheus/Grafana/DCGM/Pyroscope observability stack.
+This project provisions a standard Amazon EKS cluster with an AWS-managed Kubernetes control plane and Karpenter-provisioned GPU workers plus a retained legacy managed GPU group. Terraform also creates a VPC, private worker subnets, NAT egress, EFS model cache, NVIDIA GPU scheduling, Triton with its vLLM backend, a Prometheus/Grafana/DCGM/Pyroscope observability stack, and a dedicated internal HTTPS inference ALB with an API-key gateway.
 
 The GPU workers are **accelerated virtual EC2 instances**, not bare-metal servers. EKS still owns the control plane; AWS EC2 hosts the GPU worker nodes, and the NVIDIA EKS-optimized Amazon Linux 2023 AMI supplies the host driver/runtime pieces. The NVIDIA Kubernetes device plugin advertises `nvidia.com/gpu` to the scheduler. The Triton pod requests one GPU and therefore cannot start until a GPU worker is Ready.
 
@@ -12,7 +12,9 @@ The project uses two Terraform roots (`infra/` then `workloads/`). The first roo
 
 ```mermaid
 flowchart LR
-  Client -->|OpenAI HTTP /v1 on service port 8000| Service[ClusterIP: triton-vllm]
+  Client -->|HTTPS and bearer API key| ALB[Dedicated internal inference ALB]
+  ALB --> Gateway[API-key gateway pods]
+  Gateway -->|Discover ready pods| Service[Headless Service: triton-backends]
   Service --> Frontend[NVIDIA OpenAI-compatible frontend]
   Frontend --> Triton[Triton In-process server]
   Triton --> Backend[vLLM backend / AsyncLLMEngine]
@@ -42,7 +44,7 @@ The archive URL map is configurable. Terraform does not infer JFrog repository k
 
 ## Triton plus vLLM: who does what
 
-NVIDIA's bundled OpenAI-compatible frontend starts the Triton server in-process and exposes OpenAI REST endpoints such as `/v1/models`, `/v1/completions`, and `/v1/chat/completions`. The frontend converts OpenAI requests for the vLLM backend. The Triton vLLM backend delegates LLM execution to vLLM's asynchronous engine; vLLM performs paged KV-cache management and inflight/continuous batching. The Kubernetes Service remains private (`ClusterIP`); clients with cluster network access or administrators using `kubectl port-forward` can reach it. No API-key authentication is configured by default. [NVIDIA's OpenAI frontend documentation](https://github.com/triton-inference-server/server/tree/main/python/openai) and [vLLM backend documentation](https://github.com/triton-inference-server/vllm_backend) describe the components.
+NVIDIA's bundled OpenAI-compatible frontend starts the Triton server in-process and exposes OpenAI REST endpoints such as `/v1/models`, `/v1/completions`, and `/v1/chat/completions`. The frontend converts OpenAI requests for the vLLM backend. The Triton vLLM backend delegates LLM execution to vLLM's asynchronous engine; vLLM performs paged KV-cache management and inflight/continuous batching. Clients use a dedicated internal HTTPS ALB and API-key gateway. Terraform creates the gateway, certificate, validation/private DNS records and backend network policy. The gateway discovers ready Triton pods via a headless Service and selects an upstream for each new request; existing streams keep their original connection. See [inference.md](inference.md) for configuration and trust boundaries. [NVIDIA's OpenAI frontend documentation](https://github.com/triton-inference-server/server/tree/main/python/openai) and [vLLM backend documentation](https://github.com/triton-inference-server/vllm_backend) describe the components.
 
 The backend is decoupled: one request may produce multiple streamed responses. Its model configuration must set `model_transaction_policy { decoupled: true }`. The OpenAI frontend translates chat/completions requests into the Triton vLLM backend's model inputs and handles streaming responses.
 
@@ -68,7 +70,7 @@ Specifications below are for the requested single-GPU sizes. GPU memory is often
 
 AWS's current [EC2 accelerated-instance specification table](https://docs.aws.amazon.com/ec2/latest/instancetypes/ac.html) lists `g7.8xlarge` with a 32 GiB RTX PRO 4500 GPU. The approximate cost figures are a us-east-1 Linux on-demand snapshot from [CloudParity's G7 page](https://cloudparity.io/pricing/aws/g7.8xlarge), [EC2Info's G6 page](https://ec2info.app/g6.8xlarge), and [CloudParity's G5 page](https://cloudparity.io/pricing/aws/g5.4xlarge); check the AWS Pricing Calculator for your account, region, and purchase option before deployment. Availability, quotas, capacity, and actual rates vary by region and AZ. Set `gpu_instance_type` in `infra/terraform.tfvars` to choose an alternative.
 
-The GPU node is only one part of the bill. Also estimate the EKS cluster-hour charge, NAT Gateway hours and data, EFS storage/throughput, CloudWatch control-plane logs, public IPv4 addresses, image/model data transfer, and Prometheus storage. A continuously running GPU node dominates cost; scale the managed node group to zero when the GPU is not needed, while understanding that serving is then unavailable until it scales up.
+The GPU node is only one part of the bill. Also estimate the EKS cluster-hour charge, NAT Gateway hours and data, EFS storage/throughput, CloudWatch control-plane logs, public IPv4 addresses, image/model data transfer, and Prometheus storage. A continuously running GPU node dominates cost; KEDA and Karpenter reduce replicas and GPU nodes when demand falls, retaining one serving replica. For a complete manual stop, pause scaling and scale serving to zero, then let Karpenter reclaim empty nodes; serving is unavailable until explicitly restarted. CPU system nodes and other AWS services remain billable. See [autoscaling.md](autoscaling.md).
 
 The `g7.8xlarge` has the most VRAM of the three listed choices and is the configured default. For cost-sensitive development, G5 or G6 can run many 7B/8B models at quantized or reduced context settings, subject to the model's actual memory footprint. Start with one selected model and validate workload performance before increasing concurrency or adding GPUs.
 
@@ -79,10 +81,14 @@ The `g7.8xlarge` has the most VRAM of the three listed choices and is the config
 - **Prometheus and Grafana** collect and visualize those metrics. The stack includes a community NVIDIA DCGM dashboard as a starting point.
 - **Pyroscope plus Grafana Alloy eBPF** provide continuous CPU profiling for processes in the Triton pod on GPU workers. Alloy requires host PID access and privileged/root access for eBPF; the DaemonSet is restricted to the GPU node pool and relabels to Triton. This profiles CPU stacks, not CUDA kernels or GPU memory. DCGM supplies GPU hardware telemetry. For CUDA-kernel profiling, use NVIDIA Nsight Systems/Compute separately.
 
-The starter project keeps Grafana internal as a ClusterIP service. Access it using `kubectl port-forward`; do not expose an unauthenticated dashboard publicly.
+Grafana is reached through its separate internal, CIDR-restricted ALB over a VPN/private route. Inference uses a different internal ALB with HTTPS and bearer-key authentication.
 
 ## Security model
 
 The JFrog token is a Kubernetes Secret read by the init container. Terraform marks its input sensitive, which redacts normal CLI display, but the value is still present in Terraform state and Kubernetes API storage. Use a remote state backend with encryption, restricted IAM access, and locking; enable EKS secret encryption appropriate to your security requirements; rotate the token and Grafana password; and avoid shell history, checked-in `.tfvars`, or CI logs. The `.gitignore` excludes tfvars and state files.
 
-The EKS public API endpoint is restricted by `admin_cidr_blocks`; replace the example default with a trusted VPN/office CIDR before apply. GPU nodes use private subnets with NAT egress. Triton has only a ClusterIP service and is not Internet-facing by default. Follow least privilege for the Terraform operator and production IAM roles.
+The EKS public API endpoint is restricted by `admin_cidr_blocks`; replace the example default with a trusted VPN/office CIDR before apply. GPU nodes use private subnets with NAT egress. Triton pods remain private behind the API-key gateway and internal HTTPS inference ALB. Follow least privilege for the Terraform operator and production IAM roles.
+
+## Autoscaling inference capacity
+
+This implementation couples KEDA (a Prometheus metrics adapter/operator that creates an HPA) with Karpenter (a pending-pod-driven EC2 provisioner). HPA adjusts serving replica count; each replica requests one GPU and causes a new node to be provisioned when no existing GPU is free. The custom Triton image reports actual scheduler KV-cache usage and waiting work. CPU or framebuffer usage alone does not capture KV pressure. The two independent triggers allow either pressure to increase capacity, while a 15-minute scale-down window reduces expensive model reloads. Read [autoscaling.md](autoscaling.md) for units, formulas, defaults and limitations.
