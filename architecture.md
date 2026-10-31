@@ -94,22 +94,24 @@ Prometheus and Grafana persistence/retention should be explicitly sized for prod
 - Terraform's `sensitive` marker only redacts output. The token is stored in Terraform state and as a Kubernetes Secret. Treat both state and cluster API data as secret-bearing, encrypt and restrict them, and rotate credentials.
 - The public EKS API is restricted by `admin_cidr_blocks`; nodes and both ALBs remain private. Inference HTTPS access is restricted by `inference_ingress_cidrs` and bearer keys. Backend network policy is not an isolation boundary against node/cluster administrators or privileged host-network access.
 
-## Operational failure points
+## Validation checklist
 
-| Symptom | Likely cause |
+Use these checks to validate the deployment with the selected image, model artifacts, and configured AWS infrastructure. These are validation criteria, not a report of completed validation results. Also verify replica scale-out and scale-down using the procedures in [autoscaling.md](autoscaling.md#deployment-and-migration-checklist).
+
+| Area | Validation required |
 | --- | --- |
-| GPU node group does not create | G-series On-Demand quota/capacity or AZ availability; select an alternate type or region, request quota, and re-plan. |
-| Node is Ready but GPU pod remains Pending | NVIDIA device plugin has not registered a GPU; check plugin DaemonSet, node AMI, allocatable resource, and node selector. |
-| EFS PVC is Pending or mount fails | EFS CSI add-on/IRSA, NFS 2049 rule, EFS mount target, subnet routing, or filesystem ID. |
-| Artifactory init container fails | URL path, bearer token scope/expiry, TLS trust, archive format/size, or private Artifactory network reachability from private subnets. |
-| Triton reports model initialization error | Archive root layout, tokenizer/weight files, unsupported model architecture or quantization, vLLM/image incompatibility, or insufficient GPU memory/context configuration. |
-| OpenAI frontend fails to start | Check that the Triton image contains `python/openai/openai_frontend/main.py`, required frontend dependencies, and a valid local tokenizer directory in the selected archive. |
-| Prometheus has no GPU series | DCGM exporter scheduling/driver compatibility, scrape discovery labels/ports, or exporter chart issue. |
-| Prometheus has no vLLM series | Confirm the `triton-vllm` target is `UP`, the Triton service exposes port 8002, and the selected vLLM backend has initialized and is emitting metrics at `/metrics`. |
-| Inference HTTPS endpoint fails | ACM public DNS validation, private-zone/VPN resolution, client CIDR allowlist, gateway target health and bearer key; see [inference.md](inference.md). |
-| Grafana ingress has no ALB hostname | Check the AWS Load Balancer Controller pod/logs, its IRSA role permissions, ingress events, private subnet tags, target health, and `grafana_ingress_cidrs`. |
+| GPU capacity | Confirm sufficient G-series On-Demand quota and instance capacity in the selected AZs, and verify GPU workers are provisioned. |
+| GPU scheduling | Confirm nodes are Ready, the NVIDIA device plugin advertises allocatable GPUs, and pod GPU requests and node selectors allow scheduling. |
+| EFS storage | Confirm the PVC is Bound and pods can mount EFS; verify CSI add-on/IRSA, NFS port 2049 access, mount targets, routing, and filesystem ID. |
+| Model artifact download | Verify HTTPS URL paths, bearer token scope and expiry, TLS trust, archive format and size, and Artifactory reachability from private subnets. Confirm the init container completes. |
+| Model initialization | Verify archive layout, tokenizer and weight files, model architecture and quantization support, image/vLLM compatibility, and GPU memory/context settings. Confirm the selected model becomes ready. |
+| OpenAI frontend | Confirm the image contains `python/openai/openai_frontend/main.py`, required dependencies, and a valid local tokenizer directory. Verify the frontend starts and serves an inference request. |
+| GPU telemetry | Confirm DCGM exporter scheduling and driver compatibility, scrape labels and ports, and GPU series in Prometheus. |
+| vLLM telemetry | Confirm the `triton-vllm` target is `UP`, port 8002 exposes `/metrics`, and the initialized backend emits inference metrics plus the custom scheduler KV, waiting-request, and freshness gauges. |
+| Inference HTTPS endpoint | Verify ACM DNS validation, private-zone/VPN resolution, client CIDR allowlist, gateway target health, and bearer-key authentication; see [inference.md](inference.md). |
+| Grafana access | Confirm the ingress receives an ALB hostname and Grafana is reachable from an allowed private client. Verify Load Balancer Controller health, IRSA permissions, private subnet tags, target health, and `grafana_ingress_cidrs`. |
 
-The custom image base tag is `26.04-vllm-python-py3`, which bundles vLLM 0.19 and requires a sufficiently recent NVIDIA driver (CUDA 13.2 / driver 595.58.03 in NVIDIA's compatibility matrix). This is chosen to align with current EKS NVIDIA AL2023 AMIs that bundle the R595 driver line while supporting newer model architectures. Check the actual selected AMI driver and Triton [compatibility matrix](https://github.com/triton-inference-server/server/blob/main/docs/introduction/compatibility.md) before applying. Validate the exact model architecture (in particular `qwen35_8b`) against the vLLM version and exact archive before production. A service can deploy successfully while a model fails to load if its architecture is unsupported.
+The custom image base tag is `26.04-vllm-python-py3`, which bundles vLLM 0.19 and requires a sufficiently recent NVIDIA driver (CUDA 13.2 / driver 595.58.03 in NVIDIA's compatibility matrix). This is chosen to align with current EKS NVIDIA AL2023 AMIs that bundle the R595 driver line while supporting newer model architectures. Check the actual selected AMI driver and Triton [compatibility matrix](https://github.com/triton-inference-server/server/blob/main/docs/introduction/compatibility.md) before applying. Validate the exact model architecture (in particular `qwen35_8b`) against the vLLM version and exact archive before production. Infrastructure deployment and model readiness are separate validation steps; confirm that the selected model architecture loads successfully in the pinned image.
 
 ## Top-level architecture
 
@@ -272,7 +274,7 @@ sequenceDiagram
   Note over T: Gateway discovers ready pod IPs and balances new requests
   P->>K: Both metrics permit lower replica count
   Note over K: Wait 15-minute scale-down stabilization
-  K->>T: Remove at most one replica per minute; graceful shutdown
+  K->>T: Remove at most one replica per minute with graceful shutdown
   Note over C: Empty node remains for 10 minutes
   C->>C: Terminate empty EC2 node
 ```
