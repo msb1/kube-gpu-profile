@@ -109,3 +109,40 @@ Monitor gateway pod availability, 401/5xx access logs and ALB target health. Thi
 For teardown, stop clients and drain inference before deleting workloads. Kubernetes Ingress deletion lets AWS Load Balancer Controller clean up the inference ALB; keep that controller running until ALBs and target groups disappear. Terraform removes its private hosted zone, alias, ACM certificate and validation record. The existing Karpenter NodeClaim/EC2 drain procedure still applies before destroying infrastructure. Two ALBs, the private hosted zone and gateway CPU usage add cost; AWS-managed public ACM certificates used on ALB normally have no separate certificate charge.
 
 Official references: [ALB annotations](https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/guide/ingress/annotations/), [NGINX upstream DNS resolution](https://nginx.org/en/docs/http/ngx_http_upstream_module.html), [NGINX proxy buffering and retries](https://nginx.org/en/docs/http/ngx_http_proxy_module.html), [unprivileged NGINX image](https://github.com/nginx/docker-nginx-unprivileged), [VPC CNI network policies](https://docs.aws.amazon.com/eks/latest/userguide/cni-network-policy-configure.html).
+
+## Model artifacts and storage
+
+The model files and the inference server image are separate artifacts. The server image contains Triton, its OpenAI-compatible frontend and the vLLM backend; model weights are not baked into it. The path for the model files is:
+
+```text
+Hugging Face or another approved source
+    -> operator prepares and uploads a tar.gz archive
+JFrog Artifactory: one archive per model alias
+    -> pod init container downloads and extracts the archives
+EFS: shared, persistent cache of extracted model files
+    -> vLLM reads the selected model during startup
+Triton/vLLM: a running model instance on each replica's GPU
+```
+
+The **weights** are the trained numerical parameters, typically in large files such as `*.safetensors`. The model snapshot also includes architecture and other settings, usually in `config.json`, tokenizer files for converting text to and from tokens, and potentially other files required by that model. A **loaded model** is the running vLLM engine initialized from those files, including its GPU-resident weights and runtime allocations. The runtime KV cache is distinct from the persistent model-file cache on EFS.
+
+Prepare the artifacts before applying the workloads configuration:
+
+1. Obtain a complete snapshot for each model from Hugging Face or an approved model source, subject to its access permissions and license. Include every weight shard, model configuration, tokenizer file and any other files the model requires. Validate that the model architecture and its weight format are supported by the vLLM version in the pinned Triton image.
+2. Create a self-contained `tar.gz` for each snapshot, with the snapshot files directly at the archive root, not inside an additional enclosing directory. Materialize any symlinks into a local download cache before packaging. [operation.md](operation.md#how-the-llm-is-loaded) contains preparation guidance.
+3. Upload the archives to a JFrog Artifactory generic repository and supply their direct HTTPS download URLs in `model_archive_urls` in `workloads/terraform.tfvars`. The configured aliases are `qwen25_7b_instruct`, `qwen35_8b`, and `llama31_8b_instruct`; Terraform does not infer artifact names or upload the snapshots. Supply the download token through `TF_VAR_artifactory_token` and choose the serving alias with `selected_model`. See [the example variables](workloads/terraform.tfvars.example).
+
+This deployment does not download model files directly from Hugging Face at runtime. The first pod start can take a long time because it downloads and extracts all three archives, even though only one model is loaded for serving.
+
+## Loading the selected model
+
+Terraform creates the EFS-backed persistent volume and claim, the Triton deployment, an Artifactory token Secret, and ConfigMaps containing Triton model configuration. The implementation is in [workloads/models.tf](workloads/models.tf). The sequence at pod startup is:
+
+1. The `artifactory-model-cache` init container mounts EFS at `/models` and acquires a shared directory lock so concurrent replicas do not populate the cache simultaneously.
+2. For each alias, it checks `/models/cache/<alias>/.download-complete`. If the marker is absent, it downloads the corresponding archive using the bearer token, temporarily stores it on EFS, extracts it into `/models/cache/<alias>`, deletes the compressed archive, and creates the marker. If the marker exists, it reuses the cached files. The main container starts only after the init container succeeds for all three aliases.
+3. Terraform-generated `config.pbtxt` entries select the Triton `vllm` backend. Each corresponding `model.json` points to `/models/cache/<alias>` and supplies settings including GPU memory utilization, maximum model length and tensor parallel size. The frontend uses the selected model's tokenizer from the same cache.
+4. The frontend starts Triton with explicit model control and `--load-model=<selected_model>`. The vLLM backend reads the selected snapshot from EFS and initializes the model on the GPU. Each serving replica requests a GPU and loads its own model copy; EFS shares the files, not GPU memory. Triton readiness determines when the replica can receive inference traffic.
+
+EFS therefore holds the extracted snapshots for all three aliases, including weight shards, tokenizer and configuration files, other archive contents, and completion markers. The compressed archive is removed after successful extraction; Artifactory remains the archive source. EFS persists independently of pod and node restarts. In this configuration the model files are always present in the EFS cache before the main container loads them; a cache hit avoids a new Artifactory download, but each new replica still initializes its own GPU copy.
+
+The completion marker only indicates that the init container previously completed extraction; it does not verify the files against the current archive or a checksum. Replacing an artifact at the same URL does not automatically refresh the cache. Coordinate cache invalidation and restart as described in [operation.md](operation.md#switch-the-active-model), and use immutable versioned artifacts and integrity verification for production. If an init container is interrupted, inspect incomplete files or a stale lock before retrying. Check progress with `kubectl -n llm-serving logs deploy/triton-vllm -c artifactory-model-cache`, replacing the namespace if configured differently. A successful download does not guarantee the model fits GPU memory or is compatible with the image; verify that the selected model becomes ready.

@@ -83,6 +83,29 @@ The `g7.8xlarge` has the most VRAM of the three listed choices and is the config
 
 Grafana is reached through its separate internal, CIDR-restricted ALB over a VPN/private route. Inference uses a different internal ALB with HTTPS and bearer-key authentication.
 
+### How Pyroscope collects and uses profiles
+
+[The observability configuration](workloads/observability.tf) installs a Pyroscope server and an Alloy DaemonSet. Alloy runs on nodes labeled `workload=gpu-inference`, discovers local pods and processes every 15 seconds, and selects processes in the configured workload namespace whose pod has the label `app=triton-vllm`. Its eBPF profiler samples their CPU call stacks and forwards profiles to Pyroscope on port 4040. Grafana is configured with a Pyroscope data source and the Pyroscope app.
+
+The profiler records sampled stacks: functions executing when samples are taken, their callers, and their relative share of sampled CPU time. Depending on runtime support and available symbols, profiles can include Python and native frames. Target-derived labels help identify profiles; inspect the labels and service names available in Grafana. The configuration does not explicitly set the sampling or collection intervals. Current Alloy documentation lists defaults of 19 samples per second and a 15-second collection interval; effective defaults depend on the deployed Alloy version. See the [Alloy eBPF reference](https://grafana.com/docs/alloy/latest/reference/components/pyroscope/pyroscope.ebpf/).
+
+These CPU profiles can identify host-side work such as tokenization, Python code, or native library execution when the corresponding frames are resolved. They do not show CUDA kernel execution, GPU memory profiles, per-request traces, or memory-allocation and lock-contention profiles. Sampled CPU stacks alone cannot explain time spent waiting for the GPU or network. DCGM and Prometheus provide the separate GPU hardware metrics.
+
+To explore profiles:
+
+1. Connect to the VPC over VPN or another private route. From the `workloads` directory, run `terraform output -raw grafana_internal_alb_hostname`.
+2. Open `http://<hostname>/` and sign in as `admin` with the password supplied through `TF_VAR_grafana_admin_password`.
+3. Open **Profiles Drilldown**, or open **Explore** and select the **Pyroscope** data source. Select the available Triton service and CPU profile, and choose a time range when inference was running.
+4. Inspect the flame graph: wider frames represent a greater share of sampled CPU time. Follow the stack through its callers and compare a quiet period with a load-test period or two different load levels. Profiles Drilldown supports comparison and differential flame graphs; see [Grafana's profile exploration guide](https://grafana.com/docs/pyroscope/latest/view-and-analyze-profile-data/pyroscope-ui/).
+5. Compare the same interval with the **LLM GPU Macro Profiling** dashboard. For example, high CPU time in preprocessing alongside low GPU utilization can suggest a host-side bottleneck, which the profile can help investigate.
+
+If profiles are missing, check that Triton is running and receiving work, then inspect the observability pods and Alloy logs:
+
+```bash
+kubectl -n observability get pods
+kubectl -n observability logs daemonset/alloy-ebpf-profiler --tail=100
+```
+
 ## Security model
 
 The JFrog token is a Kubernetes Secret read by the init container. Terraform marks its input sensitive, which redacts normal CLI display, but the value is still present in Terraform state and Kubernetes API storage. Use a remote state backend with encryption, restricted IAM access, and locking; enable EKS secret encryption appropriate to your security requirements; rotate the token and Grafana password; and avoid shell history, checked-in `.tfvars`, or CI logs. The `.gitignore` excludes tfvars and state files.
