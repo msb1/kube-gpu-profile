@@ -83,6 +83,8 @@ ALB health checks use `/healthz` on the gateway. This verifies gateway availabil
 
 `triton-gateway-only` allows port 9000 only from gateway-labelled pods in the serving namespace. Port 8002 is allowed only from Prometheus-labelled pods in `observability`. This applies to both the original Triton ClusterIP and headless Service because policy selects the backend pods. VPC CNI network-policy support is enabled in infra; apply infra first and verify the policy agent and enforcement before relying on the restriction. Restrict who may create pods or set trusted labels in these namespaces.
 
+The original `triton-vllm` ClusterIP Service exposes port 8000 and forwards it to port 9000 on a selected Triton pod, where the OpenAI frontend listens. The gateway instead uses the headless `triton-backends` Service to discover ready pod IPs and connects directly to those pods on port 9000. Both paths reach the same backend port, so the policy specifies 9000; the ClusterIP Service's port 8000 does not bypass the policy.
+
 The CNI uses its default standard enforcement mode, which can temporarily allow traffic while policy is attached to a new pod. This is not isolation from privileged node processes, host-network traffic, cluster administrators or authorized port-forward users. A strict-mode deployment requires explicit policies for every required system/app endpoint, including DNS, and a staged rollout; changing that cluster-wide mode without those policies can break existing features. Treat network policy as backend access control within the cluster trust boundary, rather than authentication enforced by Triton itself.
 
 ## Verification and troubleshooting
