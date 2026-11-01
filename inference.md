@@ -128,6 +128,23 @@ Triton/vLLM: a running model instance on each replica's GPU
 
 The **weights** are the trained numerical parameters, typically in large files such as `*.safetensors`. The model snapshot also includes architecture and other settings, usually in `config.json`, tokenizer files for converting text to and from tokens, and potentially other files required by that model. A **loaded model** is the running vLLM engine initialized from those files, including its GPU-resident weights and runtime allocations. The runtime KV cache is distinct from the persistent model-file cache on EFS.
 
+Each archive contains a complete model snapshot, not just weight files. For example, its root might contain:
+
+```text
+config.json
+model-00001-of-00004.safetensors
+model-00002-of-00004.safetensors
+model-00003-of-00004.safetensors
+model-00004-of-00004.safetensors
+model.safetensors.index.json
+tokenizer.json
+tokenizer_config.json
+special_tokens_map.json
+generation_config.json
+```
+
+The weight shards hold the trained parameters; an index can map parameters to shards. Configuration describes the architecture and other settings, while tokenizer files support conversion between text and tokens. The exact files and number of shards depend on the model; include all files required by the particular snapshot rather than treating this example as a fixed manifest.
+
 Prepare the artifacts before applying the workloads configuration:
 
 1. Obtain a complete snapshot for each model from Hugging Face or an approved model source, subject to its access permissions and license. Include every weight shard, model configuration, tokenizer file and any other files the model requires. Validate that the model architecture and its weight format are supported by the vLLM version in the pinned Triton image.
@@ -143,8 +160,24 @@ Terraform creates the EFS-backed persistent volume and claim, the Triton deploym
 1. The `artifactory-model-cache` init container mounts EFS at `/models` and acquires a shared directory lock so concurrent replicas do not populate the cache simultaneously.
 2. For each alias, it checks `/models/cache/<alias>/.download-complete`. If the marker is absent, it downloads the corresponding archive using the bearer token, temporarily stores it on EFS, extracts it into `/models/cache/<alias>`, deletes the compressed archive, and creates the marker. If the marker exists, it reuses the cached files. The main container starts only after the init container succeeds for all three aliases.
 3. Terraform-generated `config.pbtxt` entries select the Triton `vllm` backend. Each corresponding `model.json` points to `/models/cache/<alias>` and supplies settings including GPU memory utilization, maximum model length and tensor parallel size. The frontend uses the selected model's tokenizer from the same cache.
-4. The frontend starts Triton with explicit model control and `--load-model=<selected_model>`. The vLLM backend reads the selected snapshot from EFS and initializes the model on the GPU. Each serving replica requests a GPU and loads its own model copy; EFS shares the files, not GPU memory. Triton readiness determines when the replica can receive inference traffic.
+4. The frontend starts Triton with explicit model control and `--load-model=<selected_model>`. The vLLM backend reads the selected snapshot from EFS, constructs the model using its configuration, and loads its weights as part of initialization on the GPU. Each serving replica requests a GPU and loads its own model copy; EFS shares the files, not GPU memory. Triton readiness determines when the replica can receive inference traffic.
 
 EFS therefore holds the extracted snapshots for all three aliases, including weight shards, tokenizer and configuration files, other archive contents, and completion markers. The compressed archive is removed after successful extraction; Artifactory remains the archive source. EFS persists independently of pod and node restarts. In this configuration the model files are always present in the EFS cache before the main container loads them; a cache hit avoids a new Artifactory download, but each new replica still initializes its own GPU copy.
 
 The completion marker only indicates that the init container previously completed extraction; it does not verify the files against the current archive or a checksum. Replacing an artifact at the same URL does not automatically refresh the cache. Coordinate cache invalidation and restart as described in [operation.md](operation.md#switch-the-active-model), and use immutable versioned artifacts and integrity verification for production. If an init container is interrupted, inspect incomplete files or a stale lock before retrying. Check progress with `kubectl -n llm-serving logs deploy/triton-vllm -c artifactory-model-cache`, replacing the namespace if configured differently. A successful download does not guarantee the model fits GPU memory or is compatible with the image; verify that the selected model becomes ready.
+
+## How the image and model work together
+
+The model and its weights are loaded together as part of initializing the model. The weights are part of the model, not a separate thing loaded after a complete model is already running. The configuration tells vLLM how to construct the model, and the weight files supply its trained parameters. The tokenizer converts incoming text to tokens and generated tokens back to text.
+
+The Docker image supplies the inference software; it is not the model snapshot. This project starts with NVIDIA's `nvcr.io/nvidia/tritonserver:26.04-vllm-python-py3` image from the NVIDIA NGC registry, which includes Triton and the vLLM backend. The project's [Dockerfile](images/triton-metrics/Dockerfile) extends it with scheduler metrics for autoscaling, including waiting requests and KV-cache usage. The operator builds and publishes that custom image to a container registry, such as Amazon ECR, and sets `triton_image` to its digest-pinned address. Kubernetes pulls and runs that image for the serving pod. See [autoscaling.md](autoscaling.md#custom-image-and-metrics-contract) for the build and publication procedure.
+
+```text
+NVIDIA NGC base image -> add project metrics extension -> publish custom image
+    -> Kubernetes runs Triton and vLLM
+Artifactory model archive -> extract snapshot to EFS
+    -> vLLM reads the selected configuration and weights
+    -> initialized model and its weights on each serving replica's GPU
+```
+
+The image and archive have separate lifecycles: publishing the server image does not package the model weights, and uploading a model archive does not install the server software. Check that the selected snapshot is compatible with the vLLM version bundled in the custom image before deployment.

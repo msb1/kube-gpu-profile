@@ -8,6 +8,18 @@ The serving floor is one replica. This is intentional: metrics produced by a sto
 
 ## What scales and why
 
+Each Triton serving pod runs one selected model through vLLM and requests one GPU. The vLLM scheduler tracks work inside that engine. A custom extension in the Triton image exports scheduler statistics as Prometheus metrics; Prometheus scrapes each pod; and two KEDA Prometheus triggers make those measurements available to a Kubernetes Horizontal Pod Autoscaler (HPA). The HPA changes the Triton Deployment's desired replica count. If a new pod cannot be scheduled because no suitable GPU is available, Karpenter provisions an eligible GPU node. The pod then starts and initializes its own model copy before becoming ready to receive traffic.
+
+```text
+vLLM scheduler on each serving pod
+  -> custom Triton metrics extension -> Prometheus
+  -> KEDA Prometheus triggers -> Kubernetes HPA
+  -> Triton replica count -> pending GPU pod, if capacity is unavailable
+  -> Karpenter GPU node -> model initialization -> ready serving pod
+```
+
+KEDA creates and configures the HPA through a `ScaledObject`; it does not itself move a running model or add GPU capacity. Karpenter responds to unschedulable pods, not directly to the scheduler metrics. Consequently, a scale-up decision does not immediately provide serving capacity: node provisioning, image availability, pod startup and model loading all contribute to the delay. Existing streams stay on their original replica.
+
 | Layer | Mechanism | Default |
 |---|---|---|
 | Pods | KEDA Prometheus triggers create one native HPA | 1–10 replicas |
@@ -19,9 +31,39 @@ The serving floor is one replica. This is intentional: metrics produced by a sto
 | Empty nodes | Karpenter consolidation | Empty for 10 minutes |
 | CPU system capacity | Managed EKS node group | Two nodes, independent of demand |
 
-The two HPA metrics implement OR for scale out: either pressure can request more replicas. Both must permit a reduction before scale down. A single combined scalar would obscure units and can accidentally implement AND. For KV usage, `Value` makes HPA calculate approximately `ceil(currentReplicas × meanUsage / 0.8)`. For the total queue with `AverageValue`, desired replicas are approximately `ceil(totalWaiting / 4)`. Kubernetes applies tolerance, readiness handling, missing-metric rules, stabilization, policies, and bounds afterward. A threshold crossing does not guarantee immediate scaling.
+### Trigger 1: KV-cache pressure
 
-Prometheus discovers each Triton pod IP, rather than scraping the load-balanced Service address. Its scrape interval is 5 seconds, so the queue’s 15-second range contains multiple samples. Queries select the configured namespace/model and successful scrapes with scheduler timestamps younger than 45 seconds. Empty results are errors (`ignoreNullValues=false`), never coerced to zero. An unavailable metric must not be interpreted as idle. Existing valid zero values remain valid. A completeness check compares fresh, successfully scraped ready-pod statistics with kube-state-metrics’ ready replica count; partial scrape loss returns an error rather than a misleading fleet average. This also depends on kube-state-metrics being available. A `TritonAutoscalingTelemetryIncomplete` alert fires after two minutes without complete telemetry; configure Alertmanager destinations for notification.
+The KV cache holds intermediate attention data used when processing and generating tokens. Each vLLM scheduler reports its current KV-cache usage as `llm_kv_cache_usage_ratio`, a fraction from 0 to 1. Prometheus calculates the mean across eligible serving pods. The default target, `kv_cache_target = 0.8`, is 80% usage. This measures scheduler KV-cache pressure, not total GPU framebuffer utilization.
+
+The trigger uses HPA metric type `Value`. Its approximate recommendation is:
+
+```text
+desired replicas = ceil(current replicas × mean KV usage / KV target)
+```
+
+For example, four replicas averaging 0.9 usage at the default 0.8 target produce `ceil(4 × 0.9 / 0.8) = 5`. KV usage is a pressure signal, not a request count. An idle engine can retain prefix cache, so usage may remain elevated after traffic falls; see the tuning guidance below.
+
+### Trigger 2: waiting requests
+
+Each scheduler reports `llm_num_requests_waiting`, the number of requests waiting inside vLLM. The Prometheus query takes a 15-second average for each eligible pod, then sums those averages across the fleet. This smooths short fluctuations while measuring total waiting work. The default `waiting_requests_target = 4` is a target of four waiting requests per replica.
+
+The trigger uses HPA metric type `AverageValue`. Its approximate recommendation is:
+
+```text
+desired replicas = ceil(total of per-pod 15-second waiting averages / waiting target)
+```
+
+For example, a fleet total of 20 averaged waiting requests at the default target produces `ceil(20 / 4) = 5` replicas. This is the vLLM internal queue; it is not necessarily the same as Triton's pending-request gauge.
+
+### Combining triggers and controlling the rate
+
+The HPA calculates a recommendation for each metric and uses the larger one. Either high KV pressure or waiting work can request scale-up; both metrics must permit a reduction before scale-down. The formulas above are approximations: Kubernetes also applies tolerance, readiness and missing-metric handling, stabilization, rate policies and the configured replica bounds. A threshold crossing does not guarantee immediate scaling.
+
+The default range is one to ten replicas. Scale-up has no stabilization window and can increase the count by up to 100% per 15 seconds. Scale-down uses a 900-second stabilization window and removes at most one pod per minute. This gives demand time to settle before removing capacity that would be costly to reload. The separate KEDA `cooldownPeriod` of 900 seconds concerns transitions to zero; it does not replace the HPA scale-down window. Normal automatic operation retains at least one replica because a stopped engine cannot report new HTTP demand, and the gateway does not wake it. The deliberate `paused_replicas = 0` setting suspends serving until autoscaling is resumed.
+
+### Metric freshness and completeness
+
+Prometheus discovers each Triton pod IP, rather than scraping the load-balanced Service address. Its scrape interval is 5 seconds, so the queue’s 15-second range contains multiple samples. Queries select the configured namespace and selected model, and use ready pods with successful scrapes and scheduler timestamps younger than 45 seconds. Empty results are errors (`ignoreNullValues=false`), never coerced to zero. An unavailable metric must not be interpreted as idle. Existing valid zero values remain valid. A completeness check compares fresh, successfully scraped ready-pod statistics with kube-state-metrics’ ready replica count; partial scrape loss returns an error rather than a misleading fleet average. This also depends on kube-state-metrics being available. A `TritonAutoscalingTelemetryIncomplete` alert fires after two minutes without complete telemetry; configure Alertmanager destinations for notification.
 
 The HPA owns `Deployment.spec.replicas`; Terraform ignores subsequent replica changes. Change bounds through `min_replicas` and `max_replicas`, not `kubectl scale` during normal operation. The original GPU min/desired/max variables control only the legacy managed GPU group.
 
